@@ -1,3 +1,7 @@
+// Single-threaded HTTP/1.1 server built on non-blocking sockets and select().
+// Supports GET, HEAD, POST, PUT, DELETE, OPTIONS and TRACE.
+// Builds with Winsock on Windows and with POSIX sockets on macOS / Linux.
+
 #define _CRT_SECURE_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 
@@ -6,18 +10,47 @@
 #include <sstream>
 #include <fstream>
 #include <map>
-#include <time.h>
-using namespace std;
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 
-#pragma comment(lib, "Ws2_32.lib")
-#include <winsock2.h>
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <winsock2.h>
+    #ifdef _MSC_VER
+        #pragma comment(lib, "Ws2_32.lib")
+    #endif
+    typedef int socklen_t;
+    const char PATH_SEP = '\\';
+#else
+    #include <sys/socket.h>
+    #include <sys/select.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+    #include <errno.h>
+    #include <signal.h>
+    typedef int SOCKET;
+    const SOCKET INVALID_SOCKET = -1;
+    const int SOCKET_ERROR = -1;
+    const int WSAEWOULDBLOCK = EWOULDBLOCK;
+    inline int closesocket(SOCKET s) { return close(s); }
+    inline int WSAGetLastError() { return errno; }
+    const char PATH_SEP = '/';
+#endif
+
+using namespace std;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const int HTTP_PORT     = 8080;
 const int MAX_SOCKETS   = 60;
-const int BUFFER_SIZE   = 8192;
-const int TIMEOUT_SEC   = 120;   // close idle connections after 2 minutes
-const char* ROOT_DIR    = "c:\\temp";
+const int BUFFER_SIZE   = 64 * 1024;  // largest request (headers + body) we accept
+const int TIMEOUT_SEC   = 120;        // close idle connections after 2 minutes
+string rootDir          = "www";      // folder the files are served from (argv[1] overrides)
 
 // Socket states
 const int EMPTY   = 0;
@@ -34,13 +67,13 @@ struct SocketState
     int     send;
     char    recvBuffer[BUFFER_SIZE];
     int     recvLen;
-    char    sendBuffer[BUFFER_SIZE * 4];   // responses can be larger
-    int     sendLen;
-    int     sendOffset;
+    string  sendBuffer;                 // grows to fit any response
+    size_t  sendOffset;
+    bool    closeAfterSend;
     time_t  lastActivity;
 };
 
-struct SocketState sockets[MAX_SOCKETS] = {0};
+SocketState sockets[MAX_SOCKETS];
 int socketsCount = 0;
 
 // ─── Prototypes ───────────────────────────────────────────────────────────────
@@ -54,34 +87,100 @@ void checkTimeouts();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Read a file from disk, return contents as string. Empty string = not found.
-string readFile(const string& path)
+bool setNonBlocking(SOCKET s)
+{
+#ifdef _WIN32
+    unsigned long flag = 1;
+    return ioctlsocket(s, FIONBIO, &flag) == 0;
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    return flags != -1 && fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+// Read a whole file. Returns false if it can't be opened (an empty file is fine).
+bool readFile(const string& path, string& content)
 {
     ifstream f(path.c_str(), ios::binary);
-    if (!f.is_open()) return "";
+    if (!f.is_open()) return false;
     ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    content = ss.str();
+    return true;
+}
+
+bool endsWith(const string& s, const string& suffix)
+{
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 // Guess Content-Type from file extension
 string getContentType(const string& path)
 {
-    if (path.size() >= 5 && path.substr(path.size()-5) == ".html") return "text/html; charset=utf-8";
-    if (path.size() >= 4 && path.substr(path.size()-4) == ".htm")  return "text/html; charset=utf-8";
-    if (path.size() >= 4 && path.substr(path.size()-4) == ".txt")  return "text/plain; charset=utf-8";
-    if (path.size() >= 4 && path.substr(path.size()-4) == ".jpg")  return "image/jpeg";
-    if (path.size() >= 5 && path.substr(path.size()-5) == ".jpeg") return "image/jpeg";
-    if (path.size() >= 4 && path.substr(path.size()-4) == ".png")  return "image/png";
-    if (path.size() >= 4 && path.substr(path.size()-4) == ".css")  return "text/css";
-    if (path.size() >= 3 && path.substr(path.size()-3) == ".js")   return "application/javascript";
+    if (endsWith(path, ".html") || endsWith(path, ".htm")) return "text/html; charset=utf-8";
+    if (endsWith(path, ".txt"))  return "text/plain; charset=utf-8";
+    if (endsWith(path, ".jpg") || endsWith(path, ".jpeg")) return "image/jpeg";
+    if (endsWith(path, ".png"))  return "image/png";
+    if (endsWith(path, ".css"))  return "text/css";
+    if (endsWith(path, ".js"))   return "application/javascript";
     return "application/octet-stream";
 }
 
-// Build a full HTTP response string
+string toLower(string s)
+{
+    transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)tolower(c); });
+    return s;
+}
+
+string trim(const string& s)
+{
+    size_t b = s.find_first_not_of(" \t");
+    if (b == string::npos) return "";
+    size_t e = s.find_last_not_of(" \t");
+    return s.substr(b, e - b + 1);
+}
+
+// Escape text before echoing it inside an HTML page
+string htmlEscape(const string& s)
+{
+    string out;
+    for (char c : s)
+    {
+        switch (c)
+        {
+        case '&': out += "&amp;";  break;
+        case '<': out += "&lt;";   break;
+        case '>': out += "&gt;";   break;
+        case '"': out += "&quot;"; break;
+        default:  out += c;
+        }
+    }
+    return out;
+}
+
+// A request path is only served if it stays inside the root folder
+bool isSafePath(const string& path)
+{
+    if (path.empty() || path[0] != '/') return false;
+    if (path.find("..") != string::npos) return false;
+    if (path.find('\\') != string::npos || path.find(':') != string::npos) return false;
+    return true;
+}
+
+// Map a URL path to a file under the root folder
+string toFilePath(const string& urlPath)
+{
+    string p = rootDir + urlPath;
+    for (char& c : p) if (c == '/') c = PATH_SEP;
+    return p;
+}
+
+// Build a full HTTP response string.
+// For HEAD requests pass includeBody = false: headers stay the same, body is dropped.
 string buildResponse(int statusCode, const string& statusText,
                      const string& contentType, const string& body,
-                     bool addAllow = false)
+                     bool addAllow = false, bool includeBody = true,
+                     bool keepAlive = true)
 {
     ostringstream resp;
     resp << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
@@ -89,9 +188,9 @@ string buildResponse(int statusCode, const string& statusText,
     resp << "Content-Length: " << body.size() << "\r\n";
     if (addAllow)
         resp << "Allow: GET, HEAD, POST, PUT, DELETE, OPTIONS, TRACE\r\n";
-    resp << "Connection: keep-alive\r\n";
+    resp << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n";
     resp << "\r\n";
-    resp << body;
+    if (includeBody) resp << body;
     return resp.str();
 }
 
@@ -135,14 +234,34 @@ bool parseRequestLine(const string& line,
     return true;
 }
 
+void queueResponse(int index, const string& response, bool closeAfter = false)
+{
+    sockets[index].sendBuffer     = response;
+    sockets[index].sendOffset     = 0;
+    sockets[index].closeAfterSend = closeAfter;
+    sockets[index].send           = SEND;
+}
+
 // ─── HTTP Request Handler ─────────────────────────────────────────────────────
 void handleHttpRequest(int index)
 {
+    // One response at a time: pipelined requests wait until the current one is sent
+    if (sockets[index].send == SEND) return;
+
     string raw(sockets[index].recvBuffer, sockets[index].recvLen);
 
     // We need at least the end of headers (\r\n\r\n)
     size_t headerEnd = raw.find("\r\n\r\n");
-    if (headerEnd == string::npos) return;   // not complete yet
+    if (headerEnd == string::npos)
+    {
+        if (sockets[index].recvLen >= BUFFER_SIZE - 1)
+        {
+            queueResponse(index, buildResponse(431, "Request Header Fields Too Large",
+                                               "text/plain", "Request headers too large", false, true, false), true);
+            sockets[index].recvLen = 0;
+        }
+        return;   // not complete yet
+    }
 
     // Parse first line
     size_t firstLineEnd = raw.find("\r\n");
@@ -151,41 +270,43 @@ void handleHttpRequest(int index)
     string method, path, queryString;
     if (!parseRequestLine(requestLine, method, path, queryString))
     {
-        string resp = buildResponse(400, "Bad Request", "text/plain", "400 Bad Request");
-        memcpy(sockets[index].sendBuffer, resp.c_str(), resp.size());
-        sockets[index].sendLen    = (int)resp.size();
-        sockets[index].sendOffset = 0;
-        sockets[index].send       = SEND;
-        sockets[index].recvLen    = 0;
+        queueResponse(index, buildResponse(400, "Bad Request", "text/plain", "400 Bad Request", false, true, false), true);
+        sockets[index].recvLen = 0;
         return;
     }
 
-    // Parse headers into a map
+    // Parse headers into a map. Header names are case-insensitive, so keys are lowercased.
     map<string,string> headers;
-    string headerBlock = raw.substr(firstLineEnd + 2, headerEnd - firstLineEnd - 2);
-    istringstream hss(headerBlock);
-    string hline;
-    while (getline(hss, hline))
+    if (headerEnd > firstLineEnd)
     {
-        if (!hline.empty() && hline.back() == '\r') hline.pop_back();
-        size_t colon = hline.find(':');
-        if (colon != string::npos)
+        string headerBlock = raw.substr(firstLineEnd + 2, headerEnd - firstLineEnd - 2);
+        istringstream hss(headerBlock);
+        string hline;
+        while (getline(hss, hline))
         {
-            string key = hline.substr(0, colon);
-            string val = hline.substr(colon + 2);   // skip ": "
-            headers[key] = val;
+            if (!hline.empty() && hline.back() == '\r') hline.pop_back();
+            size_t colon = hline.find(':');
+            if (colon != string::npos)
+                headers[toLower(trim(hline.substr(0, colon)))] = trim(hline.substr(colon + 1));
         }
     }
 
     // Body (for POST/PUT)
     string body = "";
-    int contentLength = 0;
-    if (headers.count("Content-Length"))
-        contentLength = atoi(headers["Content-Length"].c_str());
+    long contentLength = 0;
+    if (headers.count("content-length"))
+        contentLength = atol(headers["content-length"].c_str());
+    if (contentLength < 0 || headerEnd + 4 + contentLength > (size_t)BUFFER_SIZE - 1)
+    {
+        queueResponse(index, buildResponse(413, "Payload Too Large", "text/plain",
+                                           "Request body too large", false, true, false), true);
+        sockets[index].recvLen = 0;
+        return;
+    }
     if (contentLength > 0)
     {
         size_t bodyStart = headerEnd + 4;
-        if ((int)(raw.size() - bodyStart) < contentLength) return; // incomplete body
+        if (raw.size() - bodyStart < (size_t)contentLength) return; // incomplete body
         body = raw.substr(bodyStart, contentLength);
     }
 
@@ -193,79 +314,69 @@ void handleHttpRequest(int index)
     if (!queryString.empty()) cout << "?" << queryString;
     cout << endl;
 
+    bool keepAlive = toLower(headers["connection"]) != "close";
     string response;
 
     // ── OPTIONS ──────────────────────────────────────────────────────────────
     if (method == "OPTIONS")
     {
-        response = buildResponse(200, "OK", "text/plain", "", true);
+        response = buildResponse(200, "OK", "text/plain", "", true, true, keepAlive);
     }
     // ── TRACE ────────────────────────────────────────────────────────────────
     else if (method == "TRACE")
     {
         // Echo the request back as the body
         string echoBody = raw.substr(0, headerEnd + 4);
-        response = buildResponse(200, "OK", "message/http", echoBody);
+        response = buildResponse(200, "OK", "message/http", echoBody, false, true, keepAlive);
+    }
+    // Every method below touches a file, so the path must stay inside the root folder
+    else if (!isSafePath(path))
+    {
+        response = buildResponse(400, "Bad Request", "text/plain", "Invalid path",
+                                 false, method != "HEAD", keepAlive);
     }
     // ── GET / HEAD ───────────────────────────────────────────────────────────
     else if (method == "GET" || method == "HEAD")
     {
+        bool isHead = (method == "HEAD");
+
         // Default file
         if (path == "/") path = "/index.html";
 
-        // Handle ?lang= query parameter
+        // ?lang=he|en|fr serves index_he.html etc. when that version exists,
+        // otherwise the default page.
         map<string,string> params = parseQueryString(queryString);
-        string filePath;
+        string fileContent, filePath;
+        bool found = false;
 
         if (params.count("lang"))
         {
             string lang = params["lang"];
-            // strip extension, insert _<lang>, re-add extension
-            // e.g. /index.html + lang=he  →  c:\temp\index_he.html
-            size_t dot = path.rfind('.');
-            if (dot != string::npos)
+            if (lang == "he" || lang == "en" || lang == "fr")
             {
-                string base = path.substr(0, dot);
-                string ext  = path.substr(dot);
-                filePath = string(ROOT_DIR) + base + "_" + lang + ext;
-            }
-            else
-            {
-                filePath = string(ROOT_DIR) + path + "_" + lang;
+                size_t dot = path.rfind('.');
+                string localized = (dot != string::npos)
+                    ? path.substr(0, dot) + "_" + lang + path.substr(dot)
+                    : path + "_" + lang;
+                filePath = toFilePath(localized);
+                found = readFile(filePath, fileContent);
             }
         }
-        else
+        if (!found)
         {
-            filePath = string(ROOT_DIR) + path;
+            filePath = toFilePath(path);
+            found = readFile(filePath, fileContent);
         }
 
-        // Convert forward slashes to backslashes for Windows
-        for (char& c : filePath) if (c == '/') c = '\\';
-
-        string fileContent = readFile(filePath);
-        if (fileContent.empty())
+        if (!found)
         {
             string errBody = "<html><body><h1>404 Not Found</h1></body></html>";
-            response = buildResponse(404, "Not Found", "text/html", errBody);
+            response = buildResponse(404, "Not Found", "text/html", errBody, false, !isHead, keepAlive);
         }
         else
         {
-            string ct = getContentType(filePath);
-            if (method == "HEAD")
-            {
-                // HEAD: headers only, no body
-                ostringstream resp;
-                resp << "HTTP/1.1 200 OK\r\n";
-                resp << "Content-Type: " << ct << "\r\n";
-                resp << "Content-Length: " << fileContent.size() << "\r\n";
-                resp << "Connection: keep-alive\r\n";
-                resp << "\r\n";
-                response = resp.str();
-            }
-            else
-            {
-                response = buildResponse(200, "OK", ct, fileContent);
-            }
+            response = buildResponse(200, "OK", getContentType(filePath), fileContent,
+                                     false, !isHead, keepAlive);
         }
     }
     // ── POST ─────────────────────────────────────────────────────────────────
@@ -273,62 +384,54 @@ void handleHttpRequest(int index)
     {
         // Print received strings/phrases to console
         cout << "POST body received: " << body << endl;
-        string respBody = "<html><body><h1>POST received</h1><p>" + body + "</p></body></html>";
-        response = buildResponse(200, "OK", "text/html", respBody);
+        string respBody = "<html><body><h1>POST received</h1><p>" + htmlEscape(body) + "</p></body></html>";
+        response = buildResponse(200, "OK", "text/html", respBody, false, true, keepAlive);
     }
     // ── PUT ──────────────────────────────────────────────────────────────────
     else if (method == "PUT")
     {
-        if (path == "/" || path.empty())
+        if (path == "/")
         {
-            response = buildResponse(400, "Bad Request", "text/plain", "No path specified");
+            response = buildResponse(400, "Bad Request", "text/plain", "No path specified", false, true, keepAlive);
         }
         else
         {
-            string filePath = string(ROOT_DIR) + path;
-            for (char& c : filePath) if (c == '/') c = '\\';
+            string filePath = toFilePath(path);
+            string existing;
+            bool existed = readFile(filePath, existing);
 
             ofstream f(filePath.c_str(), ios::binary);
             if (!f.is_open())
             {
-                response = buildResponse(500, "Internal Server Error", "text/plain", "Could not write file");
+                response = buildResponse(500, "Internal Server Error", "text/plain", "Could not write file", false, true, keepAlive);
             }
             else
             {
                 f.write(body.c_str(), body.size());
                 f.close();
-                response = buildResponse(201, "Created", "text/plain", "File created");
+                response = existed
+                    ? buildResponse(200, "OK", "text/plain", "File updated", false, true, keepAlive)
+                    : buildResponse(201, "Created", "text/plain", "File created", false, true, keepAlive);
             }
         }
     }
     // ── DELETE ───────────────────────────────────────────────────────────────
     else if (method == "DELETE")
     {
-        string filePath = string(ROOT_DIR) + path;
-        for (char& c : filePath) if (c == '/') c = '\\';
-
-        if (remove(filePath.c_str()) == 0)
-            response = buildResponse(200, "OK", "text/plain", "File deleted");
+        if (remove(toFilePath(path).c_str()) == 0)
+            response = buildResponse(200, "OK", "text/plain", "File deleted", false, true, keepAlive);
         else
-            response = buildResponse(404, "Not Found", "text/plain", "File not found");
+            response = buildResponse(404, "Not Found", "text/plain", "File not found", false, true, keepAlive);
     }
     // ── Unknown method ───────────────────────────────────────────────────────
     else
     {
-        response = buildResponse(501, "Not Implemented", "text/plain", "Method not supported");
+        response = buildResponse(501, "Not Implemented", "text/plain", "Method not supported", false, true, keepAlive);
     }
 
-    // Copy response to send buffer
-    int respLen = (int)response.size();
-    if (respLen > (int)sizeof(sockets[index].sendBuffer))
-        respLen = (int)sizeof(sockets[index].sendBuffer);
+    queueResponse(index, response, !keepAlive);
 
-    memcpy(sockets[index].sendBuffer, response.c_str(), respLen);
-    sockets[index].sendLen    = respLen;
-    sockets[index].sendOffset = 0;
-    sockets[index].send       = SEND;
-
-    // Clear recv buffer — consume the processed request
+    // Consume the processed request, keep anything after it (pipelined requests)
     int consumed = (int)(headerEnd + 4 + contentLength);
     if (consumed < sockets[index].recvLen)
     {
@@ -349,7 +452,7 @@ void checkTimeouts()
     time_t now = time(NULL);
     for (int i = 0; i < MAX_SOCKETS; i++)
     {
-        if (sockets[i].recv == RECEIVE || sockets[i].send == SEND)
+        if (sockets[i].recv == RECEIVE)
         {
             if (difftime(now, sockets[i].lastActivity) > TIMEOUT_SEC)
             {
@@ -368,13 +471,14 @@ bool addSocket(SOCKET id, int what)
     {
         if (sockets[i].recv == EMPTY)
         {
-            sockets[i].id         = id;
-            sockets[i].recv       = what;
-            sockets[i].send       = IDLE;
-            sockets[i].recvLen    = 0;
-            sockets[i].sendLen    = 0;
-            sockets[i].sendOffset = 0;
-            sockets[i].lastActivity = time(NULL);
+            sockets[i].id             = id;
+            sockets[i].recv           = what;
+            sockets[i].send           = IDLE;
+            sockets[i].recvLen        = 0;
+            sockets[i].sendBuffer.clear();
+            sockets[i].sendOffset     = 0;
+            sockets[i].closeAfterSend = false;
+            sockets[i].lastActivity   = time(NULL);
             socketsCount++;
             return true;
         }
@@ -387,7 +491,7 @@ void removeSocket(int index)
     sockets[index].recv = EMPTY;
     sockets[index].send = EMPTY;
     sockets[index].recvLen = 0;
-    sockets[index].sendLen = 0;
+    sockets[index].sendBuffer.clear();
     socketsCount--;
 }
 
@@ -395,19 +499,20 @@ void acceptConnection(int index)
 {
     SOCKET id = sockets[index].id;
     struct sockaddr_in from;
-    int fromLen = sizeof(from);
+    socklen_t fromLen = sizeof(from);
 
     SOCKET msgSocket = accept(id, (struct sockaddr*)&from, &fromLen);
     if (INVALID_SOCKET == msgSocket)
     {
-        cout << "Error at accept(): " << WSAGetLastError() << endl;
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK)
+            cout << "Error at accept(): " << err << endl;
         return;
     }
     cout << "Client " << inet_ntoa(from.sin_addr) << ":" << ntohs(from.sin_port) << " connected." << endl;
 
-    unsigned long flag = 1;
-    if (ioctlsocket(msgSocket, FIONBIO, &flag) != 0)
-        cout << "Error at ioctlsocket(): " << WSAGetLastError() << endl;
+    if (!setNonBlocking(msgSocket))
+        cout << "Error making socket non-blocking: " << WSAGetLastError() << endl;
 
     if (!addSocket(msgSocket, RECEIVE))
     {
@@ -421,8 +526,9 @@ void receiveMessage(int index)
     SOCKET msgSocket = sockets[index].id;
     int len      = sockets[index].recvLen;
     int space    = BUFFER_SIZE - len - 1;
+    if (space <= 0) return;   // buffer full; handleHttpRequest answers 413/431
 
-    int bytesRecv = recv(msgSocket, &sockets[index].recvBuffer[len], space, 0);
+    int bytesRecv = (int)recv(msgSocket, &sockets[index].recvBuffer[len], space, 0);
 
     if (bytesRecv == SOCKET_ERROR)
     {
@@ -451,11 +557,11 @@ void receiveMessage(int index)
 void sendMessage(int index)
 {
     SOCKET msgSocket = sockets[index].id;
+    const string& buf = sockets[index].sendBuffer;
 
-    int toSend = sockets[index].sendLen - sockets[index].sendOffset;
-    int bytesSent = send(msgSocket,
-                         sockets[index].sendBuffer + sockets[index].sendOffset,
-                         toSend, 0);
+    int bytesSent = (int)send(msgSocket,
+                              buf.data() + sockets[index].sendOffset,
+                              (int)(buf.size() - sockets[index].sendOffset), 0);
 
     if (bytesSent == SOCKET_ERROR)
     {
@@ -470,11 +576,17 @@ void sendMessage(int index)
     sockets[index].sendOffset += bytesSent;
     sockets[index].lastActivity = time(NULL);
 
-    if (sockets[index].sendOffset >= sockets[index].sendLen)
+    if (sockets[index].sendOffset >= buf.size())
     {
         // Done sending
-        sockets[index].send       = IDLE;
-        sockets[index].sendLen    = 0;
+        if (sockets[index].closeAfterSend)
+        {
+            closesocket(msgSocket);
+            removeSocket(index);
+            return;
+        }
+        sockets[index].send = IDLE;
+        sockets[index].sendBuffer.clear();
         sockets[index].sendOffset = 0;
 
         // If there's still data in the recv buffer, handle it (pipelined requests)
@@ -484,53 +596,64 @@ void sendMessage(int index)
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-void main()
+int main(int argc, char* argv[])
 {
+    if (argc > 1) rootDir = argv[1];
+
+#ifdef _WIN32
     WSAData wsaData;
     if (NO_ERROR != WSAStartup(MAKEWORD(2, 2), &wsaData))
     {
         cout << "WSAStartup() failed" << endl;
-        return;
+        return 1;
     }
+#else
+    signal(SIGPIPE, SIG_IGN);   // a client closing mid-send must not kill the server
+#endif
 
     SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (INVALID_SOCKET == listenSocket)
     {
         cout << "socket() failed: " << WSAGetLastError() << endl;
-        WSACleanup();
-        return;
+        return 1;
     }
 
+#ifndef _WIN32
+    int reuse = 1;
+    setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
+
     sockaddr_in serverService;
+    memset(&serverService, 0, sizeof(serverService));
     serverService.sin_family      = AF_INET;
     serverService.sin_addr.s_addr = INADDR_ANY;
     serverService.sin_port        = htons(HTTP_PORT);
 
-    if (SOCKET_ERROR == bind(listenSocket, (SOCKADDR*)&serverService, sizeof(serverService)))
+    if (SOCKET_ERROR == bind(listenSocket, (sockaddr*)&serverService, sizeof(serverService)))
     {
         cout << "bind() failed: " << WSAGetLastError() << endl;
         closesocket(listenSocket);
-        WSACleanup();
-        return;
+        return 1;
     }
 
     if (SOCKET_ERROR == listen(listenSocket, 5))
     {
         cout << "listen() failed: " << WSAGetLastError() << endl;
         closesocket(listenSocket);
-        WSACleanup();
-        return;
+        return 1;
     }
 
+    setNonBlocking(listenSocket);
     addSocket(listenSocket, LISTEN);
     cout << "HTTP Server listening on port " << HTTP_PORT << endl;
-    cout << "Serving files from " << ROOT_DIR << endl;
+    cout << "Serving files from " << rootDir << endl;
 
     while (true)
     {
         fd_set waitRecv, waitSend;
         FD_ZERO(&waitRecv);
         FD_ZERO(&waitSend);
+        SOCKET maxFd = 0;
 
         for (int i = 0; i < MAX_SOCKETS; i++)
         {
@@ -538,28 +661,29 @@ void main()
                 FD_SET(sockets[i].id, &waitRecv);
             if (sockets[i].send == SEND)
                 FD_SET(sockets[i].id, &waitSend);
+            if (sockets[i].recv != EMPTY && sockets[i].id > maxFd)
+                maxFd = sockets[i].id;
         }
 
-        // Timeout of 5 seconds so we can check for idle connections
+        // Wake up at least every 5 seconds to close idle connections
         timeval tv;
         tv.tv_sec  = 5;
         tv.tv_usec = 0;
 
-        int nfd = select(0, &waitRecv, &waitSend, NULL, &tv);
+        int nfd = select((int)maxFd + 1, &waitRecv, &waitSend, NULL, &tv);
         if (nfd == SOCKET_ERROR)
         {
             cout << "select() failed: " << WSAGetLastError() << endl;
-            WSACleanup();
-            return;
+            break;
         }
 
         checkTimeouts();
 
-        for (int i = 0; i < MAX_SOCKETS && nfd > 0; i++)
+        for (int i = 0; i < MAX_SOCKETS; i++)
         {
+            if (sockets[i].recv == EMPTY) continue;   // may have been closed above
             if (FD_ISSET(sockets[i].id, &waitRecv))
             {
-                nfd--;
                 switch (sockets[i].recv)
                 {
                 case LISTEN:  acceptConnection(i); break;
@@ -568,17 +692,17 @@ void main()
             }
         }
 
-        for (int i = 0; i < MAX_SOCKETS && nfd > 0; i++)
+        for (int i = 0; i < MAX_SOCKETS; i++)
         {
-            if (FD_ISSET(sockets[i].id, &waitSend))
-            {
-                nfd--;
-                if (sockets[i].send == SEND)
-                    sendMessage(i);
-            }
+            if (sockets[i].recv == EMPTY) continue;
+            if (sockets[i].send == SEND && FD_ISSET(sockets[i].id, &waitSend))
+                sendMessage(i);
         }
     }
 
     closesocket(listenSocket);
+#ifdef _WIN32
     WSACleanup();
+#endif
+    return 0;
 }
