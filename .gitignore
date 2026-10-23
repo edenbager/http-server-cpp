@@ -1,0 +1,6 @@
+webserver
+*.exe
+*.obj
+*.o
+.DS_Store
+__pycache__/
