@@ -629,7 +629,7 @@ int main(int argc, char* argv[])
     serverService.sin_addr.s_addr = INADDR_ANY;
     serverService.sin_port        = htons(HTTP_PORT);
 
-    if (SOCKET_ERROR == bind(listenSocket, (sockaddr*)&serverService, sizeof(serverService)))
+    if (SOCKET_ERROR == ::bind(listenSocket, (sockaddr*)&serverService, sizeof(serverService)))
     {
         cout << "bind() failed: " << WSAGetLastError() << endl;
         closesocket(listenSocket);
