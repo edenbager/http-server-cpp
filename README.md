@@ -1,5 +1,7 @@
 # http-server-cpp
 
+[![tests](https://github.com/edenbager/http-server-cpp/actions/workflows/tests.yml/badge.svg)](https://github.com/edenbager/http-server-cpp/actions/workflows/tests.yml)
+
 A small HTTP/1.1 web server in C++, written from scratch on raw sockets. It serves many clients at once from a **single thread**, using **non-blocking sockets** and `select()`. Built for the Introduction to Computer Networks course at The Academic College of Tel Aviv–Yaffo.
 
 **Stack:** C++17 · Berkeley sockets / Winsock · `select()` · Python (tests)
